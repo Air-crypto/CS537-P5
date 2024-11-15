@@ -1,3 +1,5 @@
+#include "wmap.h"
+
 // Per-CPU state
 struct cpu {
   uchar apicid;                // Local APIC ID
@@ -34,6 +36,16 @@ struct context {
 
 enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+// Track memory mappings
+struct mapping {
+  uint addr;           // Starting virtual address
+  int length;         // Length of mapping
+  int flags;          // Mapping flags
+  struct file* f;     // File pointer (NULL for anonymous)
+  int valid;          // Is this mapping entry valid?
+  int n_loaded_pages; // Number of physically loaded pages
+};
+
 // Per-process state
 struct proc {
   uint sz;                     // Size of process memory (bytes)
@@ -49,6 +61,7 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct mapping maps[MAX_WMMAP_INFO];  // Memory mappings
 };
 
 // Process memory is laid out contiguously, low addresses first:

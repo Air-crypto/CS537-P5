@@ -7,6 +7,9 @@
 #include "x86.h"
 #include "traps.h"
 #include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 // Interrupt descriptor table (shared by all CPUs).
 struct gatedesc idt[256];
@@ -77,6 +80,56 @@ trap(struct trapframe *tf)
             cpuid(), tf->cs, tf->eip);
     lapiceoi();
     break;
+
+  case T_PGFLT: {
+    uint va = rcr2();  // Get faulting virtual address
+    struct proc *curproc = myproc();
+    
+    // Check if address is in any mapping
+    for(int i = 0; i < MAX_WMMAP_INFO; i++) {
+      if(!curproc->maps[i].valid)
+        continue;
+        
+      uint start = curproc->maps[i].addr;
+      uint end = start + curproc->maps[i].length;
+      
+      if(va >= start && va < end) {
+        // Align to page boundary
+        va = PGROUNDDOWN(va);
+        
+        char *mem = kalloc();
+        if(mem == 0) {
+          cprintf("wmap: out of memory\n");
+          myproc()->killed = 1;
+          return;
+        }
+        memset(mem, 0, PGSIZE);
+        
+        // For file-backed mapping, read from file
+        if(curproc->maps[i].f) {
+          int offset = va - start;
+          struct file *f = curproc->maps[i].f;
+          ilock(f->ip);
+          readi(f->ip, mem, offset, PGSIZE);
+          iunlock(f->ip);
+        }
+        
+        if(mappages(curproc->pgdir, (char*)va, PGSIZE, V2P(mem), PTE_W|PTE_U) < 0) {
+          kfree(mem);
+          cprintf("wmap: mappages failed\n");
+          myproc()->killed = 1;
+          return;
+        }
+        
+        curproc->maps[i].n_loaded_pages++;
+        return;
+      }
+  }
+  
+  cprintf("Segmentation Fault\n");
+  myproc()->killed = 1;
+  return;
+}
 
   //PAGEBREAK: 13
   default:
