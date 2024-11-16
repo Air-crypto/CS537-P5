@@ -235,3 +235,21 @@ sys_wunmap(void)
   
   return SUCCESS;
 }
+
+int
+sys_va2pa(void)
+{
+  uint va;
+  if(argint(0, (int*)&va) < 0)
+    return -1;
+  return va2pa(va);
+}
+
+int
+sys_getwmapinfo(void)
+{
+  struct wmapinfo *wminfo;
+  if(argptr(0, (void*)&wminfo, sizeof(*wminfo)) < 0)
+    return FAILED;
+  return getwmapinfo(wminfo);
+}

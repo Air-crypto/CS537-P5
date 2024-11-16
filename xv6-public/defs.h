@@ -1,4 +1,5 @@
 #include "mmu.h"
+#include "wmap.h"
 
 struct buf;
 struct context;
@@ -199,3 +200,6 @@ void inc_ref_count(char*);
 void dec_ref_count(char*);
 
 void mark_parent_pages_cow(pde_t*, uint);
+
+uint va2pa(uint);
+int getwmapinfo(struct wmapinfo*);

@@ -559,3 +559,63 @@ procdump(void)
     cprintf("\n");
   }
 }
+
+uint
+va2pa(uint va)
+{
+  pte_t *pte;
+  uint pa;
+  struct proc *p = myproc();
+
+  // Walk the page table to find the PTE for the given virtual address
+  pte = walkpgdir(p->pgdir, (void*)va, 0);
+  if(!pte)
+    return -1;  // Invalid virtual address
+
+  if(!(*pte & PTE_P))
+    return -1;  // Page not present
+
+  pa = PTE_ADDR(*pte);       // Get the physical page frame address
+  pa |= va & 0xFFF;          // Add the offset within the page
+
+  return pa;
+}
+
+int
+getwmapinfo(struct wmapinfo *wminfo)
+{
+  struct proc *p = myproc();
+  int count = 0;
+
+  if(wminfo == 0)
+    return FAILED;
+
+  // Initialize wminfo
+  wminfo->total_mmaps = 0;
+  for(int i = 0; i < MAX_WMMAP_INFO; i++){
+    wminfo->addr[i] = 0;
+    wminfo->length[i] = 0;
+    wminfo->n_loaded_pages[i] = 0;
+  }
+
+  acquire(&ptable.lock);
+
+  for(int i = 0; i < MAX_WMMAP_INFO; i++){
+    if(p->maps[i].valid){
+      if(count >= MAX_WMMAP_INFO)
+        break;
+
+      wminfo->addr[count] = p->maps[i].addr;
+      wminfo->length[count] = p->maps[i].length;
+      wminfo->n_loaded_pages[count] = p->maps[i].n_loaded_pages;
+
+      count++;
+    }
+  }
+
+  release(&ptable.lock);
+
+  wminfo->total_mmaps = count;
+
+  return SUCCESS;
+}
