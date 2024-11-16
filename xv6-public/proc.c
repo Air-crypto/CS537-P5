@@ -6,6 +6,9 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct {
   struct spinlock lock;
@@ -235,8 +238,51 @@ fork(void)
 
   pid = np->pid;
 
+  // Copy memory mappings from parent to child
+  memmove(np->maps, curproc->maps, sizeof(curproc->maps));
+
+  // Set up page table entries for mapped regions
+  for(i = 0; i < MAX_WMMAP_INFO; i++){
+    if(np->maps[i].valid){
+      uint addr = np->maps[i].addr;
+      uint length = np->maps[i].length;
+      uint a = PGROUNDDOWN(addr);
+      uint last = PGROUNDDOWN(addr + length - 1);
+
+      for(; a <= last; a += PGSIZE){
+        pte_t *pte_parent = walkpgdir(curproc->pgdir, (char*)a, 0);
+        pte_t *pte_child = walkpgdir(np->pgdir, (char*)a, 1); // Allocate page table if necessary
+
+        if(!pte_parent || !pte_child)
+          panic("fork: walkpgdir failed");
+
+        if(*pte_parent & PTE_P){
+          uint pa = PTE_ADDR(*pte_parent);
+          uint flags = PTE_FLAGS(*pte_parent);
+
+          // Handle copy-on-write if necessary
+          if(flags & PTE_W){
+            flags &= ~PTE_W;
+            flags |= PTE_COW;
+            *pte_parent &= ~PTE_W;
+            *pte_parent |= PTE_COW;
+          }
+
+          *pte_child = pa | flags;
+
+          // Increment reference count for the physical page
+          inc_ref_count_locked(P2V(pa));
+        }
+      }
+    }
+  }
+
   // Adjust parent's PTEs to be read-only and set PTE_COW where appropriate
   mark_parent_pages_cow(curproc->pgdir, curproc->sz);
+
+  // Flush TLB for parent and child
+  lcr3(V2P(curproc->pgdir)); // Parent
+  lcr3(V2P(np->pgdir));      // Child
 
   acquire(&ptable.lock);
 
@@ -246,7 +292,6 @@ fork(void)
 
   return pid;
 }
-
 
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
@@ -274,6 +319,38 @@ exit(void)
   end_op();
   curproc->cwd = 0;
 
+  // Unmap all memory mappings
+  for(int i = 0; i < MAX_WMMAP_INFO; i++){
+    if(curproc->maps[i].valid){
+      uint addr = curproc->maps[i].addr;
+      uint length = curproc->maps[i].length;
+      uint a = PGROUNDDOWN(addr);
+      uint last = PGROUNDDOWN(addr + length - 1);
+
+      for(; a <= last; a += PGSIZE){
+        pte_t *pte = walkpgdir(curproc->pgdir, (char*)a, 0);
+        if(pte && (*pte & PTE_P)){
+          uint pa = PTE_ADDR(*pte);
+
+          // Decrement reference count and free if necessary
+          dec_ref_count_locked(P2V(pa));
+          if(get_ref_count_locked(P2V(pa)) == 0){
+            kfree(P2V(pa));
+          }
+
+          // Clear the PTE
+          *pte = 0;
+        }
+      }
+
+      // Mark the mapping as invalid
+      curproc->maps[i].valid = 0;
+    }
+  }
+
+  // Flush the TLB
+  lcr3(V2P(curproc->pgdir));
+
   acquire(&ptable.lock);
 
   // Parent might be sleeping in wait().
@@ -293,6 +370,7 @@ exit(void)
   sched();
   panic("zombie exit");
 }
+
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
@@ -558,6 +636,135 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+uint
+wmap(uint addr, int length, int flags, int fd)
+{
+  struct proc *curproc = myproc();
+  struct file *f = 0;
+  
+  // Validate arguments
+  if(length <= 0)
+    return FAILED;
+
+  // Check required flags
+  if((flags & MAP_FIXED) == 0 || (flags & MAP_SHARED) == 0)
+    return FAILED;
+
+  // Validate address range
+  if(addr < 0x60000000 || addr + length > 0x80000000 || addr % PGSIZE != 0)
+    return FAILED;
+
+  // For file-backed mapping
+  if(!(flags & MAP_ANONYMOUS)) {
+    if(fd < 0 || fd >= NOFILE || (f = curproc->ofile[fd]) == 0)
+      return FAILED;
+    // Verify it's an inode and opened with RDWR
+    if(f->type != FD_INODE || !(f->writable && f->readable))
+      return FAILED;
+    filedup(f);  // Increment ref count
+  }
+
+  // Find free mapping slot
+  int i;
+  for(i = 0; i < MAX_WMMAP_INFO; i++) {
+    if(!curproc->maps[i].valid)
+      break;
+  }
+  if(i == MAX_WMMAP_INFO)
+    return FAILED;
+
+  // Initialize mapping
+  curproc->maps[i].addr = addr;
+  curproc->maps[i].length = length;
+  curproc->maps[i].flags = flags;
+  curproc->maps[i].valid = 1;
+  curproc->maps[i].n_loaded_pages = 0;
+  curproc->maps[i].f = f;
+
+  return addr;
+}
+
+int
+wunmap(uint addr)
+{
+  struct proc *curproc = myproc();
+  pde_t *pgdir = curproc->pgdir;
+
+  // Check if address is page-aligned
+  if(addr % PGSIZE != 0)
+    return FAILED;
+
+  // Find the mapping
+  int map_index = -1;
+  for(int i = 0; i < MAX_WMMAP_INFO; i++) {
+    if(curproc->maps[i].valid && curproc->maps[i].addr == addr) {
+      map_index = i;
+      break;
+    }
+  }
+
+  // Return error if no mapping found at this address
+  if(map_index == -1)
+    return FAILED;
+
+  struct mapping *m = &curproc->maps[map_index];
+  uint num_pages = (m->length + PGSIZE - 1) / PGSIZE;
+
+  // For each page in the mapping
+  for(uint offset = 0; offset < num_pages * PGSIZE; offset += PGSIZE) {
+    uint va = addr + offset;
+    pte_t *pte = walkpgdir(pgdir, (char*)va, 0);
+
+    // Skip if page wasn't allocated (due to lazy allocation)
+    if(!pte || !(*pte & PTE_P))
+      continue;
+
+    // Get the physical address
+    uint pa = PTE_ADDR(*pte);
+
+    // If this is a file-backed MAP_SHARED mapping, write back to file
+    if(m->f && (m->flags & MAP_SHARED)) {
+      // Calculate file offset for this page
+      uint file_offset = offset;
+
+      // If this offset is within file bounds
+      if(file_offset < m->length) {
+        struct file *f = m->f;
+
+        // Write the page contents back to file
+        ilock(f->ip);
+        // Only write up to the remaining length for the last page
+        uint write_size = PGSIZE;
+        if(file_offset + PGSIZE > m->length)
+          write_size = m->length - file_offset;
+
+        writei(f->ip, P2V(pa), file_offset, write_size);
+        iunlock(f->ip);
+      }
+    }
+
+    // Free the physical page
+    kfree(P2V(pa));
+
+    // Clear the PTE
+    *pte = 0;
+  }
+
+  // If it was a file mapping, close the file
+  if(m->f) {
+    fileclose(m->f);
+    m->f = 0;
+  }
+
+  // Mark the mapping as invalid
+  m->valid = 0;
+
+  // Flush the TLB
+  lcr3(V2P(pgdir));
+
+  return SUCCESS;
 }
 
 uint

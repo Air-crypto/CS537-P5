@@ -1,3 +1,5 @@
+#include "wmap.h"
+
 struct stat;
 struct rtcdate;
 
@@ -23,6 +25,10 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+uint wmap(uint, int, int, int);
+int wunmap(uint);
+uint va2pa(uint);
+int getwmapinfo(struct wmapinfo*);
 
 // ulib.c
 int stat(const char*, struct stat*);

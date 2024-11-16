@@ -199,7 +199,13 @@ int get_ref_count(char*);
 void inc_ref_count(char*);
 void dec_ref_count(char*);
 
+int get_ref_count_locked(char*);
+void inc_ref_count_locked(char*);
+void dec_ref_count_locked(char*);
+
 void mark_parent_pages_cow(pde_t*, uint);
 
+uint wmap(uint, int, int, int);
+int wunmap(uint);
 uint va2pa(uint);
 int getwmapinfo(struct wmapinfo*);

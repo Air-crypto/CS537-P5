@@ -76,6 +76,34 @@ dec_ref_count(char *pa)
     ref_counts[V2P(pa)/PGSIZE]--;
 }
 
+int
+get_ref_count_locked(char *pa)
+{
+  int count;
+  acquire(&kmem.lock);
+  count = ref_counts[V2P(pa)/PGSIZE];
+  release(&kmem.lock);
+  return count;
+}
+
+void
+inc_ref_count_locked(char *pa)
+{
+  acquire(&kmem.lock);
+  if(ref_counts[V2P(pa)/PGSIZE] < 255)
+    ref_counts[V2P(pa)/PGSIZE]++;
+  release(&kmem.lock);
+}
+
+void
+dec_ref_count_locked(char *pa)
+{
+  acquire(&kmem.lock);
+  if(ref_counts[V2P(pa)/PGSIZE] > 0)
+    ref_counts[V2P(pa)/PGSIZE]--;
+  release(&kmem.lock);
+}
+
 //PAGEBREAK: 21
 // Free the page of physical memory pointed at by v,
 // which normally should have been returned by a
