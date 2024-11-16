@@ -177,6 +177,29 @@ growproc(int n)
 // Create a new process copying p as the parent.
 // Sets up stack to return as if from system call.
 // Caller must set state of returned proc to RUNNABLE.
+void
+mark_parent_pages_cow(pde_t *pgdir, uint sz)
+{
+  pte_t *pte;
+  uint i;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
+      panic("mark_parent_pages_cow: pte should exist");
+    if(!(*pte & PTE_P))
+      continue;
+    uint flags = PTE_FLAGS(*pte);
+    if(flags & PTE_W){
+      *pte &= ~PTE_W;    // Clear the writable flag
+      *pte |= PTE_COW;   // Set the copy-on-write flag
+    }
+  }
+
+  // Flush the TLB to ensure the CPU uses the updated PTEs
+  lcr3(V2P(pgdir));
+}
+
+
 int
 fork(void)
 {
@@ -185,9 +208,8 @@ fork(void)
   struct proc *curproc = myproc();
 
   // Allocate process.
-  if((np = allocproc()) == 0){
+  if((np = allocproc()) == 0)
     return -1;
-  }
 
   // Copy process state from proc.
   if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
@@ -203,6 +225,7 @@ fork(void)
   // Clear %eax so that fork returns 0 in the child.
   np->tf->eax = 0;
 
+  // Copy file descriptors and current working directory.
   for(i = 0; i < NOFILE; i++)
     if(curproc->ofile[i])
       np->ofile[i] = filedup(curproc->ofile[i]);
@@ -212,6 +235,9 @@ fork(void)
 
   pid = np->pid;
 
+  // Adjust parent's PTEs to be read-only and set PTE_COW where appropriate
+  mark_parent_pages_cow(curproc->pgdir, curproc->sz);
+
   acquire(&ptable.lock);
 
   np->state = RUNNABLE;
@@ -220,6 +246,7 @@ fork(void)
 
   return pid;
 }
+
 
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state

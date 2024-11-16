@@ -68,8 +68,18 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
   for(;;){
     if((pte = walkpgdir(pgdir, a, 1)) == 0)
       return -1;
-    if(*pte & PTE_P)
-      panic("remap");
+
+    if(*pte & PTE_P){
+      // Allow remapping if the page is marked as COW
+      if(*pte & PTE_COW){
+        // Decrement ref count of the old page
+        uint old_pa = PTE_ADDR(*pte);
+        dec_ref_count((char*)P2V(old_pa));
+      } else {
+        panic("remap");
+      }
+    }
+
     *pte = pa | perm | PTE_P;
     if(a == last)
       break;
@@ -78,6 +88,7 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
   }
   return 0;
 }
+
 
 // There is one page table per process, plus one that's used when
 // a CPU is not running any process (kpgdir). The kernel uses the
@@ -330,25 +341,33 @@ copyuvm(pde_t *pgdir, uint sz)
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
+
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
       panic("copyuvm: pte should exist");
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
+    
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+    
+    // For the child, if page is writable, mark it COW and read-only
+    if(flags & PTE_W){
+      flags &= ~PTE_W;        // Clear the writable flag
+      flags |= PTE_COW;       // Set the copy-on-write flag
     }
+    
+    // Map the page into the child's page table with the adjusted flags
+    if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0)
+      goto bad;
+    
+    // Increment the reference count for the shared page
+    inc_ref_count(P2V(pa));
   }
+
   return d;
 
 bad:

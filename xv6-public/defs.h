@@ -193,3 +193,9 @@ void            clearpteu(pde_t *pgdir, char *uva);
 
 pte_t* walkpgdir(pde_t *pgdir, const void *va, int alloc);
 int mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm);
+
+int get_ref_count(char*);
+void inc_ref_count(char*);
+void dec_ref_count(char*);
+
+void mark_parent_pages_cow(pde_t*, uint);

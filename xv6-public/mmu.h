@@ -4,6 +4,8 @@
 // This file contains definitions for the
 // x86 memory management unit (MMU).
 
+#define PTE_COW       0x800
+
 // Eflags register
 #define FL_IF           0x00000200      // Interrupt Enable
 

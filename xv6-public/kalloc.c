@@ -23,6 +23,8 @@ struct {
   struct run *freelist;
 } kmem;
 
+static unsigned char ref_counts[PHYSTOP/PGSIZE];
+
 // Initialization happens in two phases.
 // 1. main() calls kinit1() while still using entrypgdir to place just
 // the pages mapped by entrypgdir on free list.
@@ -33,6 +35,8 @@ kinit1(void *vstart, void *vend)
 {
   initlock(&kmem.lock, "kmem");
   kmem.use_lock = 0;
+  // Initialize all reference counts to 0
+  memset(ref_counts, 0, sizeof(ref_counts));
   freerange(vstart, vend);
 }
 
@@ -51,6 +55,27 @@ freerange(void *vstart, void *vend)
   for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
     kfree(p);
 }
+
+int
+get_ref_count(char *pa)
+{
+  return ref_counts[V2P(pa)/PGSIZE];
+}
+
+void
+inc_ref_count(char *pa)
+{
+  if(ref_counts[V2P(pa)/PGSIZE] < 255)
+    ref_counts[V2P(pa)/PGSIZE]++;
+}
+
+void
+dec_ref_count(char *pa)
+{
+  if(ref_counts[V2P(pa)/PGSIZE] > 0)
+    ref_counts[V2P(pa)/PGSIZE]--;
+}
+
 //PAGEBREAK: 21
 // Free the page of physical memory pointed at by v,
 // which normally should have been returned by a
@@ -64,14 +89,22 @@ kfree(char *v)
   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(v, 1, PGSIZE);
-
   if(kmem.use_lock)
     acquire(&kmem.lock);
-  r = (struct run*)v;
-  r->next = kmem.freelist;
-  kmem.freelist = r;
+
+  // Decrease the reference count
+  dec_ref_count(v);
+
+  // Only free if reference count is zero
+  if(get_ref_count(v) == 0) {
+    // Fill with junk to catch dangling refs.
+    memset(v, 1, PGSIZE);
+
+    r = (struct run*)v;
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+  }
+
   if(kmem.use_lock)
     release(&kmem.lock);
 }
@@ -87,10 +120,21 @@ kalloc(void)
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r) {
     kmem.freelist = r->next;
-  if(kmem.use_lock)
-    release(&kmem.lock);
+
+    // Initialize reference count
+    ref_counts[V2P((char*)r)/PGSIZE] = 1;
+
+    if(kmem.use_lock)
+      release(&kmem.lock);
+
+    // Fill with junk to catch uninitialized usage.
+    memset((char*)r, 5, PGSIZE);
+  } else {
+    if(kmem.use_lock)
+      release(&kmem.lock);
+  }
   return (char*)r;
 }
 

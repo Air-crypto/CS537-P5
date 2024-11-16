@@ -84,6 +84,42 @@ trap(struct trapframe *tf)
   case T_PGFLT: {
     uint va = rcr2();  // Get faulting virtual address
     struct proc *curproc = myproc();
+
+    // First check if it's a COW page fault
+    pte_t *pte = walkpgdir(curproc->pgdir, (void*)PGROUNDDOWN(va), 0);
+    if(pte && (*pte & PTE_P) && (*pte & PTE_COW)) {
+      char *mem;
+      uint pa = PTE_ADDR(*pte);
+      
+      // Allocate new page
+      if((mem = kalloc()) == 0) {
+        cprintf("cow: out of memory\n");
+        curproc->killed = 1;
+        return;
+      }
+      
+      // Copy the old page
+      memmove(mem, P2V(pa), PGSIZE);
+      
+      // Map the new page RW
+      uint flags = PTE_FLAGS(*pte);
+      flags = (flags | PTE_W) & ~PTE_COW;  // Make writable and clear COW flag
+      
+      if(mappages(curproc->pgdir, (void*)PGROUNDDOWN(va), PGSIZE, V2P(mem), flags) < 0) {
+        kfree(mem);
+        cprintf("cow: mappages failed\n");
+        curproc->killed = 1;
+        return;
+      }
+      
+      // Decrement reference count of old page
+      dec_ref_count(P2V(pa));
+      
+      // Flush TLB
+      lcr3(V2P(curproc->pgdir));
+      
+      return;
+    }
     
     // Check if address is in any mapping
     for(int i = 0; i < MAX_WMMAP_INFO; i++) {
