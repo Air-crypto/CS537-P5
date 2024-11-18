@@ -241,6 +241,13 @@ fork(void)
   // Copy memory mappings from parent to child
   memmove(np->maps, curproc->maps, sizeof(curproc->maps));
 
+  // Handle file references for file-backed mappings
+  for(i = 0; i < MAX_WMMAP_INFO; i++){
+    if(np->maps[i].valid && np->maps[i].f){
+      filedup(np->maps[i].f);
+    }
+  }
+
   // Set up page table entries for mapped regions
   for(i = 0; i < MAX_WMMAP_INFO; i++){
     if(np->maps[i].valid){
@@ -251,7 +258,7 @@ fork(void)
 
       for(; a <= last; a += PGSIZE){
         pte_t *pte_parent = walkpgdir(curproc->pgdir, (char*)a, 0);
-        pte_t *pte_child = walkpgdir(np->pgdir, (char*)a, 1); // Allocate page table if necessary
+        pte_t *pte_child = walkpgdir(np->pgdir, (char*)a, 1);
 
         if(!pte_parent || !pte_child)
           panic("fork: walkpgdir failed");
@@ -260,18 +267,23 @@ fork(void)
           uint pa = PTE_ADDR(*pte_parent);
           uint flags = PTE_FLAGS(*pte_parent);
 
-          // Handle copy-on-write if necessary
-          if(flags & PTE_W){
-            flags &= ~PTE_W;
-            flags |= PTE_COW;
-            *pte_parent &= ~PTE_W;
-            *pte_parent |= PTE_COW;
+          // Check if mapping is MAP_SHARED
+          if(np->maps[i].flags & MAP_SHARED){
+            // Do not modify flags; share the page
+          } else {
+            // For private mappings, apply copy-on-write if necessary
+            if(flags & PTE_W){
+              flags &= ~PTE_W;
+              flags |= PTE_COW;
+              *pte_parent &= ~PTE_W;
+              *pte_parent |= PTE_COW;
+            }
           }
 
           *pte_child = pa | flags;
 
           // Increment reference count for the physical page
-          inc_ref_count_locked(P2V(pa));
+          inc_ref_count(P2V(pa));
         }
       }
     }
@@ -661,9 +673,25 @@ wmap(uint addr, int length, int flags, int fd)
     if(fd < 0 || fd >= NOFILE || (f = curproc->ofile[fd]) == 0)
       return FAILED;
     // Verify it's an inode and opened with RDWR
-    if(f->type != FD_INODE || !(f->writable && f->readable))
+    if(f->type != FD_INODE || !(f->writable || f->readable))
       return FAILED;
     filedup(f);  // Increment ref count
+  }
+
+  // Check for overlapping mappings
+  uint new_start = addr;
+  uint new_end = addr + length;
+  for(int j = 0; j < MAX_WMMAP_INFO; j++) {
+    if(curproc->maps[j].valid) {
+      uint existing_start = curproc->maps[j].addr;
+      uint existing_end = existing_start + curproc->maps[j].length;
+      
+      // Check for overlap
+      if(!(new_end <= existing_start || new_start >= existing_end)) {
+        // There is an overlap
+        return FAILED;
+      }
+    }
   }
 
   // Find free mapping slot
@@ -745,8 +773,11 @@ wunmap(uint addr)
       }
     }
 
-    // Free the physical page
-    kfree(P2V(pa));
+    // Decrement reference count and free if necessary
+    dec_ref_count(P2V(pa));
+    if(get_ref_count(P2V(pa)) == 0){
+      kfree(P2V(pa));
+    }
 
     // Clear the PTE
     *pte = 0;
