@@ -249,8 +249,15 @@ fork(void)
         pte_t *pte_parent = walkpgdir(curproc->pgdir, (char*)a, 0);
         pte_t *pte_child = walkpgdir(np->pgdir, (char*)a, 1);
 
-        if(!pte_parent || !pte_child)
-          panic("fork: walkpgdir failed");
+	if(!pte_child)
+	  panic("fork: walkpgdir failed for child");
+
+        if(!pte_parent) {
+          // Parent doesn't have a valid PTE for the address
+	  // So mark child as not present, will trigger lazy allocation in child
+	  *pte_child = 0;
+	  continue;
+	}
 
         if(*pte_parent & PTE_P){
           uint pa = PTE_ADDR(*pte_parent);
@@ -273,7 +280,11 @@ fork(void)
 
           // Increment reference count for the physical page
           inc_ref_count_locked(P2V(pa));
-        }
+        } else {
+	  // Parent PTE not present, ensure lazy allocation works in child
+	  // Copy flags, but leave it not present
+	  *pte_child = PTE_FLAGS(*pte_parent) & ~PTE_P; 
+	}
       }
     }
   }
