@@ -202,7 +202,6 @@ mark_parent_pages_cow(pde_t *pgdir, uint sz)
   lcr3(V2P(pgdir));
 }
 
-
 int
 fork(void)
 {
@@ -215,28 +214,18 @@ fork(void)
     return -1;
 
   // Copy process state from proc.
-  if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
+  if((np->pgdir = setupkvm()) == 0){
     kfree(np->kstack);
     np->kstack = 0;
     np->state = UNUSED;
     return -1;
   }
+
+  // Copy parent's page table to child
+  // But mark all writable pages as read-only and COW
   np->sz = curproc->sz;
   np->parent = curproc;
   *np->tf = *curproc->tf;
-
-  // Clear %eax so that fork returns 0 in the child.
-  np->tf->eax = 0;
-
-  // Copy file descriptors and current working directory.
-  for(i = 0; i < NOFILE; i++)
-    if(curproc->ofile[i])
-      np->ofile[i] = filedup(curproc->ofile[i]);
-  np->cwd = idup(curproc->cwd);
-
-  safestrcpy(np->name, curproc->name, sizeof(curproc->name));
-
-  pid = np->pid;
 
   // Copy memory mappings from parent to child
   memmove(np->maps, curproc->maps, sizeof(curproc->maps));
@@ -269,37 +258,84 @@ fork(void)
 
           // Check if mapping is MAP_SHARED
           if(np->maps[i].flags & MAP_SHARED){
-            // Do not modify flags; share the page
+            // For shared mappings, keep the same flags
+            *pte_child = pa | flags;
           } else {
-            // For private mappings, apply copy-on-write if necessary
+            // For private mappings, apply copy-on-write if writable
             if(flags & PTE_W){
-              flags &= ~PTE_W;
-              flags |= PTE_COW;
+              flags &= ~PTE_W;    // Clear writable flag
+              flags |= PTE_COW;   // Set copy-on-write flag
               *pte_parent &= ~PTE_W;
               *pte_parent |= PTE_COW;
             }
+            *pte_child = pa | flags;
           }
 
-          *pte_child = pa | flags;
-
           // Increment reference count for the physical page
-          inc_ref_count(P2V(pa));
+          inc_ref_count_locked(P2V(pa));
         }
       }
     }
   }
 
-  // Adjust parent's PTEs to be read-only and set PTE_COW where appropriate
-  mark_parent_pages_cow(curproc->pgdir, curproc->sz);
+  // Clear %eax so that fork returns 0 in the child.
+  np->tf->eax = 0;
 
-  // Flush TLB for parent and child
-  lcr3(V2P(curproc->pgdir)); // Parent
-  lcr3(V2P(np->pgdir));      // Child
+  // Copy file descriptors and current working directory
+  for(i = 0; i < NOFILE; i++)
+    if(curproc->ofile[i])
+      np->ofile[i] = filedup(curproc->ofile[i]);
+  np->cwd = idup(curproc->cwd);
+
+  safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+
+  pid = np->pid;
+
+  // Now handle the regular process memory (text, data, heap)
+  // Mark all writable pages as COW in both parent and child
+  for(i = 0; i < curproc->sz; i += PGSIZE){
+    pte_t *pte = walkpgdir(curproc->pgdir, (void*)i, 0);
+    if(pte == 0)
+      continue;
+    if(!(*pte & PTE_P))
+      continue;
+    if(*pte & PTE_W){
+      // If page is writable, mark it as COW
+      uint pa = PTE_ADDR(*pte);
+      uint flags = PTE_FLAGS(*pte);
+      
+      // Clear writable flag and set COW flag
+      flags &= ~PTE_W;
+      flags |= PTE_COW;
+      
+      // Update parent's PTE
+      *pte = pa | flags;
+      
+      // Map the page in child's page table
+      pte_t *pte_child = walkpgdir(np->pgdir, (void*)i, 1);
+      if(pte_child == 0)
+        panic("fork: child walkpgdir failed");
+      *pte_child = pa | flags;
+      
+      // Increment reference count
+      inc_ref_count_locked(P2V(pa));
+    } else {
+      // For read-only pages, just copy the PTE and increment ref count
+      uint pa = PTE_ADDR(*pte);
+      pte_t *pte_child = walkpgdir(np->pgdir, (void*)i, 1);
+      if(pte_child == 0)
+        panic("fork: child walkpgdir failed");
+      *pte_child = *pte;
+      inc_ref_count_locked(P2V(pa));
+    }
+  }
+
+  // Flush TLB for both parent and child
+  lcr3(V2P(curproc->pgdir));
+  lcr3(V2P(np->pgdir));
 
   acquire(&ptable.lock);
-
   np->state = RUNNABLE;
-
   release(&ptable.lock);
 
   return pid;
@@ -760,7 +796,8 @@ wunmap(uint addr)
       // If this offset is within file bounds
       if(file_offset < m->length) {
         struct file *f = m->f;
-
+        begin_op();  // Start transaction for file system operations
+        
         // Write the page contents back to file
         ilock(f->ip);
         // Only write up to the remaining length for the last page
@@ -770,12 +807,13 @@ wunmap(uint addr)
 
         writei(f->ip, P2V(pa), file_offset, write_size);
         iunlock(f->ip);
+        end_op();  // End transaction
       }
     }
 
     // Decrement reference count and free if necessary
-    dec_ref_count(P2V(pa));
-    if(get_ref_count(P2V(pa)) == 0){
+    dec_ref_count_locked(P2V(pa));
+    if(get_ref_count_locked(P2V(pa)) == 0) {
       kfree(P2V(pa));
     }
 
